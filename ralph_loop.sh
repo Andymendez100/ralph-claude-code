@@ -32,7 +32,12 @@ LIVE_OUTPUT=false       # Show Claude Code output in real-time (streaming)
 LIVE_LOG_FILE="$RALPH_DIR/live.log"  # Fixed file for live output monitoring
 CALL_COUNT_FILE="$RALPH_DIR/.call_count"
 TIMESTAMP_FILE="$RALPH_DIR/.last_reset"
+ACCOUNT_INDEX_FILE="$RALPH_DIR/.current_account_index"
 USE_TMUX=false
+
+# Account rotation (populated from .ralphrc: CLAUDE_CONFIG_DIRS=(...))
+ACCOUNT_ROTATION="${ACCOUNT_ROTATION:-false}"
+CLAUDE_CONFIG_DIRS=()
 
 # Save environment variable state BEFORE setting defaults
 # These are used by load_ralphrc() to determine which values came from environment
@@ -458,6 +463,27 @@ increment_call_counter() {
     ((calls_made++))
     echo "$calls_made" > "$CALL_COUNT_FILE"
     echo "$calls_made"
+}
+
+# Get current account index from disk (defaults to 0)
+get_current_account_index() {
+    if [[ -f "$ACCOUNT_INDEX_FILE" ]]; then
+        cat "$ACCOUNT_INDEX_FILE"
+    else
+        echo "0"
+    fi
+}
+
+# Advance to next account in CLAUDE_CONFIG_DIRS rotation
+# Returns 0 (success) if rotated to a new account
+# Returns 1 (failure) if all accounts exhausted (wrapped back to 0)
+advance_account_rotation() {
+    local total=${#CLAUDE_CONFIG_DIRS[@]}
+    local current=0
+    [[ -f "$ACCOUNT_INDEX_FILE" ]] && current=$(cat "$ACCOUNT_INDEX_FILE")
+    local next=$(( (current + 1) % total ))
+    echo "$next" > "$ACCOUNT_INDEX_FILE"
+    [[ $next -ne 0 ]]  # return 0 (success) if rotated, 1 if wrapped (exhausted)
 }
 
 # Wait for rate limit reset with countdown
@@ -1086,8 +1112,10 @@ execute_claude_code() {
     local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
     local output_file="$LOG_DIR/claude_output_${timestamp}.log"
     local loop_count=$1
-    local calls_made=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
-    calls_made=$((calls_made + 1))
+    # Persist call count immediately so monitor dashboard reflects actual usage
+    # API calls consume rate limits regardless of success/failure
+    local calls_made
+    calls_made=$(increment_call_counter)
 
     # Fix #141: Capture git HEAD SHA at loop start to detect commits as progress
     # Store in file for access by progress detection after Claude execution
@@ -1096,6 +1124,21 @@ execute_claude_code() {
         loop_start_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
     fi
     echo "$loop_start_sha" > "$RALPH_DIR/.loop_start_sha"
+
+    # Set CLAUDE_CONFIG_DIR for account rotation if configured
+    # Index 0 is the default account — don't set CLAUDE_CONFIG_DIR to avoid interfering with default auth
+    # Only set it explicitly for non-default accounts (index > 0)
+    if [[ "$ACCOUNT_ROTATION" == "true" && ${#CLAUDE_CONFIG_DIRS[@]} -gt 0 ]]; then
+        local account_idx
+        account_idx=$(get_current_account_index)
+        if [[ $account_idx -gt 0 && $account_idx -lt ${#CLAUDE_CONFIG_DIRS[@]} ]]; then
+            export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIRS[$account_idx]}"
+            log_status "INFO" "🔑 Using Claude account $((account_idx + 1))/${#CLAUDE_CONFIG_DIRS[@]}: $CLAUDE_CONFIG_DIR"
+        elif [[ $account_idx -eq 0 ]]; then
+            unset CLAUDE_CONFIG_DIR  # Use Claude's default config dir for account 1
+            log_status "INFO" "🔑 Using Claude account 1/${#CLAUDE_CONFIG_DIRS[@]} (default)"
+        fi
+    fi
 
     log_status "LOOP" "Executing Claude Code (Call $calls_made/$MAX_CALLS_PER_HOUR)"
     local timeout_seconds=$((CLAUDE_TIMEOUT_MINUTES * 60))
@@ -1392,9 +1435,6 @@ EOF
     fi
 
     if [ $exit_code -eq 0 ]; then
-        # Only increment counter on successful execution
-        echo "$calls_made" > "$CALL_COUNT_FILE"
-
         # Clear progress file
         echo '{"status": "completed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
 
@@ -1509,9 +1549,15 @@ EOF
 
         # Layer 3: Filtered text fallback — only check tail, excluding tool result lines
         # Filters out type:user, tool_result, and tool_use_id lines which contain echoed file content
-        if tail -30 "$output_file" 2>/dev/null | grep -vE '"type"\s*:\s*"user"' | grep -v '"tool_result"' | grep -v '"tool_use_id"' | grep -qi "5.*hour.*limit\|limit.*reached.*try.*back\|usage.*limit.*reached"; then
+        if tail -30 "$output_file" 2>/dev/null | grep -vE '"type"\s*:\s*"user"' | grep -v '"tool_result"' | grep -v '"tool_use_id"' | grep -qi "5.*hour.*limit\|limit.*reached.*try.*back\|usage.*limit.*reached\|hit your limit"; then
             log_status "ERROR" "🚫 Claude API 5-hour usage limit reached"
             return 2  # API limit detected via text fallback
+        fi
+
+        # Layer 4: Account not logged in — treat as rotatable error when rotation is configured
+        if [[ "$ACCOUNT_ROTATION" == "true" ]] && grep -qi "not logged in\|please run /login" "$output_file" 2>/dev/null; then
+            log_status "ERROR" "🔐 Claude account not logged in — triggering rotation"
+            return 2  # Use same code as API limit so rotation logic fires
         fi
 
         log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
@@ -1702,8 +1748,9 @@ main() {
         update_status "$loop_count" "$calls_made" "executing" "running"
         
         # Execute Claude Code
-        execute_claude_code "$loop_count"
-        local exec_result=$?
+        # Use || to prevent set -e from exiting on non-zero return codes (2=API limit, 3=circuit breaker)
+        local exec_result=0
+        execute_claude_code "$loop_count" || exec_result=$?
         
         if [ $exec_result -eq 0 ]; then
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
@@ -1718,10 +1765,23 @@ main() {
             log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
             break
         elif [ $exec_result -eq 2 ]; then
-            # API 5-hour limit reached - handle specially
+            # API 5-hour limit reached - try account rotation first, then prompt
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused"
             log_status "WARN" "🛑 Claude API 5-hour limit reached!"
-            
+
+            # Account rotation: switch to next account if configured and available
+            if [[ "$ACCOUNT_ROTATION" == "true" && ${#CLAUDE_CONFIG_DIRS[@]} -gt 1 ]]; then
+                if advance_account_rotation; then
+                    local new_idx
+                    new_idx=$(get_current_account_index)
+                    log_status "INFO" "🔄 Rotating to account $((new_idx + 1))/${#CLAUDE_CONFIG_DIRS[@]}: ${CLAUDE_CONFIG_DIRS[$new_idx]}"
+                    reset_session "account_rotation"  # Sessions are per-account; start fresh
+                    continue  # Retry immediately with new account
+                else
+                    log_status "WARN" "🔄 All accounts exhausted (wrapped back to account 1), waiting for reset..."
+                fi
+            fi
+
             # Ask user whether to wait or exit
             echo -e "\n${YELLOW}The Claude API 5-hour usage limit has been reached.${NC}"
             echo -e "${YELLOW}You can either:${NC}"

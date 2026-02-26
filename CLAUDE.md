@@ -176,7 +176,7 @@ tmux attach -t <session-name>
 
 ### Running Tests
 ```bash
-# Run all tests (566 tests)
+# Run all tests (577 tests)
 npm test
 
 # Run specific test suites
@@ -209,6 +209,32 @@ The loop is controlled by several key files and environment variables within the
 - Default: 100 API calls per hour (configurable via `--calls` flag)
 - Automatic hourly reset with countdown display
 - Call tracking persists across script restarts
+
+### Account Rotation (Issue #81)
+
+When a Claude account hits the 5-hour API usage limit, Ralph can automatically switch to the next configured account instead of waiting.
+
+**Configuration in `.ralphrc`:**
+```bash
+ACCOUNT_ROTATION=true
+CLAUDE_CONFIG_DIRS=("$HOME/.claude" "$HOME/.claude-account2")
+```
+
+**Behavior:**
+- When `exec_result == 2` (API limit), Ralph calls `advance_account_rotation()` before showing the wait/exit prompt
+- Rotation advances the index in `.ralph/.current_account_index` and continues the loop immediately
+- Sessions are reset on rotation — each account starts a fresh session (sessions are per-account)
+- When all accounts are exhausted (index wraps to 0), Ralph falls through to the normal wait/exit prompt
+- Index 0 (default account) uses Claude's default config dir — `CLAUDE_CONFIG_DIR` is **unset** to avoid breaking keychain auth
+- Non-default accounts (index > 0) have `CLAUDE_CONFIG_DIR` exported to the corresponding path
+- "Not logged in" errors also trigger rotation when `ACCOUNT_ROTATION=true` (Layer 4 detection)
+- Fully opt-in — zero behavior change when `ACCOUNT_ROTATION` is not set or `false`
+
+**State file:** `.ralph/.current_account_index` — persists rotation position across restarts
+
+**Key functions:**
+- `get_current_account_index()` — reads current account index from disk (defaults to 0)
+- `advance_account_rotation()` — advances to next account; returns 0 if rotated, 1 if all exhausted (wrapped)
 
 ### Modern CLI Configuration (Phase 1.1)
 
@@ -519,17 +545,17 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 
 ## Test Suite
 
-### Test Files (566 tests total)
+### Test Files (577 tests total)
 
 | File | Tests | Description |
 |------|-------|-------------|
 | `test_circuit_breaker_recovery.bats` | 19 | Cooldown timer, auto-reset, parse_iso_to_epoch, CLI flag (Issue #160) |
 | `test_cli_parsing.bats` | 35 | CLI argument parsing for all flags + monitor parameter forwarding |
-| `test_cli_modern.bats` | 66 | Modern CLI commands (Phase 1.1) + build_claude_command fix + live mode text format fix (#164) + errexit pipeline guard (#175) + ALLOWED_TOOLS tightening (#149) + API limit false positive detection (#183) + Claude CLI command validation (#97) |
+| `test_cli_modern.bats` | 69 | Modern CLI commands (Phase 1.1) + build_claude_command fix + live mode text format fix (#164) + errexit pipeline guard (#175) + ALLOWED_TOOLS tightening (#149) + API limit false positive detection (#183) + Claude CLI command validation (#97) + account rotation Layer 4 detection (#81) |
 | `test_json_parsing.bats` | 52 | JSON output format parsing + Claude CLI format + session management + array format |
 | `test_session_continuity.bats` | 44 | Session lifecycle management + expiration + circuit breaker integration + issue #91 fix |
 | `test_exit_detection.bats` | 53 | Exit signal detection + EXIT_SIGNAL-based completion indicators + progress detection |
-| `test_rate_limiting.bats` | 15 | Rate limiting behavior |
+| `test_rate_limiting.bats` | 23 | Rate limiting behavior + monitor call counter display fix + account rotation index/advance functions (#81) |
 | `test_loop_execution.bats` | 20 | Integration tests |
 | `test_edge_cases.bats` | 25 | Edge case handling |
 | `test_installation.bats` | 15 | Global installation/uninstall workflows + dotfile template copying (#174) |
